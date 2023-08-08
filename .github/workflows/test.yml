@@ -176,13 +176,6 @@ jobs:
       run: pip install -e '.[metal,webgpu,testing]' --extra-index-url https://download.pytorch.org/whl/cpu
     - name: Test LLaMA compile speed
       run: PYTHONPATH="." METAL=1 python3 test/external/external_test_speed_llama.py
-    #- name: Run dtype test
-    #  run: DEBUG=4 METAL=1 python -m pytest -n=auto test/test_dtype.py
-    # dtype test has issues on test_half_to_int8
-    - name: Run metal ops test
-      run: DEBUG=2 METAL=1 python -m pytest -n=auto test/test_ops.py
-    - name: Run JIT test
-      run: DEBUG=2 METAL=1 python -m pytest -n=auto test/test_jit.py
     - name: Check Device.DEFAULT
       run: WEBGPU=1 python -c "from tinygrad.lazy import Device; assert Device.DEFAULT == 'WEBGPU', Device.DEFAULT"
     #- name: Run webgpu pytest
@@ -194,10 +187,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        backend: [llvm, clang, gpu, cuda]
+        backend: [llvm, clang, gpu, cuda, metal]
 
     name: Tests on (${{ matrix.backend }})
-    runs-on: ${{ matrix.backend == 'gpu'  && 'ubuntu-20.04' || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.backend == 'gpu'  && 'ubuntu-20.04' || matrix.backend == 'metal'  && 'macos-13' || 'ubuntu-latest' }}
     timeout-minutes: 20
 
     steps:
@@ -213,7 +206,7 @@ jobs:
           path: '~/.cache/pip'
           key: ${{ matrix.backend }}
       - name: Set env
-        run: printf "${{ matrix.backend == 'llvm' && 'ENABLE_METHOD_CACHE=1\nLLVM=1' || matrix.backend == 'clang' && 'CLANG=1\nENABLED_METHOD_CACHE=1' || matrix.backend == 'gpu' && 'GPU=1' || matrix.backend == 'cuda' && 'FORWARD_ONLY=1\nJIT=1\nOPT=2\nCUDA=1\nCUDACPU=1\n'}}" >> $GITHUB_ENV
+        run: printf "${{ matrix.backend == 'llvm' && 'ENABLE_METHOD_CACHE=1\nLLVM=1' || matrix.backend == 'clang' && 'CLANG=1\nENABLED_METHOD_CACHE=1' || matrix.backend == 'gpu' && 'GPU=1' || matrix.backend == 'metal' && 'METAL=1' || matrix.backend == 'cuda' && 'FORWARD_ONLY=1\nJIT=1\nOPT=2\nCUDA=1\nCUDACPU=1\n'}}" >> $GITHUB_ENV
       - name: Find faster apt mirror
         uses: vegardit/fast-apt-mirror.sh@v1
       - name: Install packages (gpu)
@@ -255,9 +248,9 @@ jobs:
           cd ${{ github.workspace }}/gpuocelot/ocelot/build
           sudo ninja install
       - name: Install dependencies
-        run: pip install -e '.[testing${{matrix.backend=='llvm'&&',llvm'||matrix.backend=='cuda'&&',cuda'||''}}]' --extra-index-url https://download.pytorch.org/whl/cpu
+        run: pip install -e '.[testing${{matrix.backend=='llvm'&&',llvm'||matrix.backend=='cuda'&&',cuda'||matrix.backend=='metal'&&',metal'||''}}]' --extra-index-url https://download.pytorch.org/whl/cpu
       - name: Check Device.DEFAULT
-        run: python -c "from tinygrad.lazy import Device; assert Device.DEFAULT in ['LLVM','CLANG','CUDA','GPU'], Device.DEFAULT"
+        run: python -c "from tinygrad.lazy import Device; assert Device.DEFAULT in ['LLVM','CLANG','CUDA','GPU','METAL'], Device.DEFAULT"
       - name: Run pytest (not cuda)
         if: matrix.backend!='cuda'
         run: python -m pytest -n=auto test/ -k '${{matrix.backend=='llvm'&&'not (test_nn.py and test_conv_transpose2d)'||'test'}}' -m 'not exclude_${{matrix.backend}}'

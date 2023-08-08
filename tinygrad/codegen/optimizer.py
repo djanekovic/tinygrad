@@ -107,7 +107,7 @@ def hand_coded_optimizations(k:Linearizer):
 
   # should use tensor cores?
   # first, confirm it's a straightforward mulacc on a device with real locals
-  tensor_cores_allowed = getenv("TC", 1) != 0 and (getenv("TC", 1) == 2 or (k.bufs[0].device == "METAL" and getenv("CI", "") != "true"))
+  tensor_cores_allowed = getenv("TC", 1) != 0 and (getenv("TC", 1) == 2 or k.bufs[0].device == "METAL")
   if tensor_cores_allowed and k.reduceop and k.reduceop.op == ReduceOps.SUM and \
       isinstance(k.reduceop.src[0], LazyOp) and k.reduceop.src[0].op == BinaryOps.MUL and \
       isinstance(k.reduceop.src[0].src[0], LazyBuffer) and isinstance(k.reduceop.src[0].src[1], LazyBuffer) and k.opts.has_local:
@@ -118,49 +118,48 @@ def hand_coded_optimizations(k:Linearizer):
     axis_buf0 = [(i,k.full_shape[i],buf1_strides[i]) for i,s in enumerate(buf0_strides) if s == 0 and k.full_shape[i]%8 == 0]
     axis_buf1 = [(i,k.full_shape[i],buf0_strides[i]) for i,s in enumerate(buf1_strides) if s == 0 and k.full_shape[i]%8 == 0]
     if len(axis_buf0) and len(axis_buf1) and k.full_shape[k.first_reduce]%8 == 0 and (k.shape_len-k.first_reduce) == 1:
-      if DEBUG >= 3: print("TENSOR CORES", axis_buf0, axis_buf1)
-      k.use_tensor_cores = getenv("TC", 1) == 1  # TC=2 will do the shape ops without the WMMA
+      s0, s1 = max(axis_buf0, key=lambda x: x[1])[0], max(axis_buf1, key=lambda x: x[1])[0]
+      if all([k.full_shape[i] >= 8**[s0, s1, k.first_reduce].count(i) for i in range(k.shape_len)]):
+        if DEBUG >= 3: print("TENSOR CORES", axis_buf0, axis_buf1)
+        k.use_tensor_cores = getenv("TC", 1) == 1  # TC=2 will do the shape ops without the WMMA
+        global_count = k.first_reduce
 
-      # TODO: select axis in smart way
-      s0, s1 = axis_buf0[-1][0], axis_buf1[-1][0]
-      global_count = k.first_reduce
+        # upcast first
+        if k.full_shape[k.first_reduce] > 8: k.shift_to(k.first_reduce, 8)
+        k.upcast()
 
-      # upcast first
-      if k.full_shape[k.first_reduce] > 8: k.shift_to(k.first_reduce, 8)
-      k.upcast()
+        # 2 locals
+        k.shift_to(s1, 8, insert_before=k.first_reduce)  # axis 2
+        k.shift_to(s0, 8, insert_before=k.first_reduce)  # axis 3
 
-      # 2 locals
-      k.shift_to(s1, 8, insert_before=k.first_reduce)  # axis 2
-      k.shift_to(s0, 8, insert_before=k.first_reduce)  # axis 3
+        # permuted+upcast for tensor cores
+        k.shift_to(global_count, 4, insert_before=k.first_reduce)
+        k.shift_to(global_count+1, 4, insert_before=k.first_reduce)
+        k.shift_to(k.first_reduce-1, 2)
+        k.upcast()
 
-      # permuted+upcast for tensor cores
-      k.shift_to(global_count, 4, insert_before=k.first_reduce)
-      k.shift_to(global_count+1, 4, insert_before=k.first_reduce)
-      k.shift_to(k.first_reduce-1, 2)
-      k.upcast()
+        # final global upcast
+        for ax in [s1, s0]:
+          for upc in [4,3,2]:
+            if k.full_shape[ax]%upc == 0:
+              k.shift_to(ax, upc)
+              k.upcast()
+              break
 
-      # final global upcast
-      for ax in [s1, s0]:
-        for upc in [4,3,2]:
-          if k.full_shape[ax]%upc == 0:
-            k.shift_to(ax, upc)
-            k.upcast()
-            break
+        # alias buffer
+        k.local_dims = k.first_reduce - global_count
+        alias_pattern = [0]*global_count + [2] * k.local_dims + [0] * (k.shape_len-k.upcasted-k.first_reduce) + [1,1] + [3] * (k.upcasted-2)
+        k.alias_buffer(buf0, alias_pattern)
+        k.alias_buffer(buf1, alias_pattern)
 
-      # alias buffer
-      k.local_dims = k.first_reduce - global_count
-      alias_pattern = [0]*global_count + [2] * k.local_dims + [0] * (k.shape_len-k.upcasted-k.first_reduce) + [1,1] + [3] * (k.upcasted-2)
-      k.alias_buffer(buf0, alias_pattern)
-      k.alias_buffer(buf1, alias_pattern)
+        # very late upcast to run group at the same time. only if actually using real tensor cores, otherwise local isn't a simdgroup
+        if k.use_tensor_cores and k.full_shape[s0] % 2 == 0:
+          k.shift_to(s0, 2, insert_before=k.first_reduce-k.local_dims)
+          k.local_dims += 1
+          k.exclude_local_upcast += 1
 
-      # very late upcast to run group at the same time. only if actually using real tensor cores, otherwise local isn't a simdgroup
-      if k.use_tensor_cores and k.full_shape[s0] % 2 == 0:
-        k.shift_to(s0, 2, insert_before=k.first_reduce-k.local_dims)
-        k.local_dims += 1
-        k.exclude_local_upcast += 1
-
-      # early exit
-      return
+        # early exit
+        return
 
   if k.opts.has_local:
     # are we grouping? (requires local shape support)
